@@ -3,7 +3,9 @@
 > vite
 
 
-  VITE v5.4.20  ready in 255 ms
+  VITE v5.4.20  ready in 310 ms
 
   ➜  Local:   http://localhost:3000/
-  ➜  Network: http://172.20.8.214:3000/
+  ➜  Network: http://172.20.35.100:3000/
+8:29:35 PM [vite] ✨ new dependencies optimized: @ffmpeg/ffmpeg, @ffmpeg/util
+8:29:35 PM [vite] ✨ optimized dependencies changed. reloading

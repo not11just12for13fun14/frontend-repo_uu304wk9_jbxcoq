@@ -1,190 +1,260 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { FFmpeg } from '@ffmpeg/ffmpeg'
+import { toBlobURL } from '@ffmpeg/util'
 
-function App() {
-  const baseUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
-  const [status, setStatus] = useState(null)
-  const [loading, setLoading] = useState(false)
-  const [message, setMessage] = useState('')
-
-  const [email, setEmail] = useState('')
-  const [phone, setPhone] = useState('')
-  const [tz, setTz] = useState('America/New_York')
-  const [minutesBefore, setMinutesBefore] = useState(10)
-  const [active, setActive] = useState(true)
-  const [refreshToken, setRefreshToken] = useState('')
+function useFFmpeg() {
+  const ffmpegRef = useRef(null)
+  const [ready, setReady] = useState(false)
+  const [loadingMsg, setLoadingMsg] = useState('')
 
   useEffect(() => {
-    fetchStatus()
+    const load = async () => {
+      try {
+        setLoadingMsg('Fetching FFmpeg core…')
+        const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd'
+        const ffmpeg = new FFmpeg()
+        ffmpeg.on('log', ({ message }) => {
+          // optionally handle logs
+          // console.debug('[ffmpeg]', message)
+        })
+        await ffmpeg.load({
+          coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+          wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+          workerURL: await toBlobURL(`${baseURL}/ffmpeg-worker.js`, 'text/javascript'),
+        })
+        ffmpegRef.current = ffmpeg
+        setReady(true)
+        setLoadingMsg('')
+      } catch (e) {
+        setLoadingMsg(`Failed to load FFmpeg: ${e.message}`)
+      }
+    }
+    load()
   }, [])
 
-  const fetchStatus = async () => {
-    try {
-      const res = await fetch(`${baseUrl}/api/status`)
-      const data = await res.json()
-      setStatus(data)
-    } catch (e) {
-      setStatus({ error: e.message })
-    }
+  return { ffmpeg: ffmpegRef.current, ready, loadingMsg }
+}
+
+const presets = [
+  { id: '1080p', label: '1080p (max width 1920)', scale: 1920 },
+  { id: '720p', label: '720p (max width 1280)', scale: 1280 },
+  { id: '480p', label: '480p (max width 854)', scale: 854 },
+  { id: 'original', label: 'Original size', scale: null },
+]
+
+function App() {
+  const { ffmpeg, ready, loadingMsg } = useFFmpeg()
+  const [queue, setQueue] = useState([]) // {id, file, name, status, progress, outputUrl, error}
+  const [running, setRunning] = useState(false)
+  const [crf, setCrf] = useState(24) // lower = better quality
+  const [preset, setPreset] = useState('medium') // ultrafast .. placebo
+  const [sizePreset, setSizePreset] = useState('720p')
+  const idCounter = useRef(0)
+
+  const selectedScale = useMemo(() => presets.find(p => p.id === sizePreset)?.scale ?? null, [sizePreset])
+
+  const addFiles = (files) => {
+    const items = Array.from(files).map(f => ({
+      id: `${Date.now()}-${idCounter.current++}`,
+      file: f,
+      name: f.name,
+      status: 'queued',
+      progress: 0,
+      outputUrl: null,
+      error: null,
+    }))
+    setQueue(prev => [...prev, ...items])
   }
 
-  const saveUser = async () => {
-    setLoading(true)
-    setMessage('')
-    try {
-      const res = await fetch(`${baseUrl}/api/user`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, phone_e164: phone, timezone: tz })
-      })
-      if (!res.ok) throw new Error(await res.text())
-      setMessage('Saved user details')
-      await fetchStatus()
-    } catch (e) {
-      setMessage(`Error: ${e.message}`)
-    } finally {
-      setLoading(false)
-    }
+  const onDrop = (e) => {
+    e.preventDefault()
+    if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files)
+  }
+  const onBrowse = (e) => {
+    if (e.target.files?.length) addFiles(e.target.files)
   }
 
-  const saveRule = async () => {
-    setLoading(true)
-    setMessage('')
-    try {
-      const res = await fetch(`${baseUrl}/api/reminder-rule`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_email: email, minutes_before: Number(minutesBefore), active })
-      })
-      if (!res.ok) throw new Error(await res.text())
-      setMessage('Saved reminder rule')
-      await fetchStatus()
-    } catch (e) {
-      setMessage(`Error: ${e.message}`)
-    } finally {
-      setLoading(false)
+  useEffect(() => {
+    const processNext = async () => {
+      if (!ready || !ffmpeg) return
+      if (!running) return
+      const nextIndex = queue.findIndex(item => item.status === 'queued')
+      if (nextIndex === -1) {
+        // nothing queued, keep running in case new files arrive
+        return
+      }
+      const item = queue[nextIndex]
+      try {
+        updateItem(item.id, { status: 'processing', progress: 0, error: null })
+        const inputName = `in_${item.id}`
+        const outputName = `out_${item.id}.mp4`
+        await ffmpeg.writeFile(inputName, await item.file.arrayBuffer())
+
+        ffmpeg.on('progress', ({ progress }) => {
+          updateItem(item.id, { progress: Math.round((progress || 0) * 100) })
+        })
+
+        const vfArgs = selectedScale ? ['-vf', `scale='min(${selectedScale},iw)':-2`] : []
+        const args = [
+          '-i', inputName,
+          ...vfArgs,
+          '-c:v', 'libx264',
+          '-crf', String(crf),
+          '-preset', preset,
+          '-c:a', 'aac', '-b:a', '128k',
+          '-movflags', '+faststart',
+          outputName,
+        ]
+        await ffmpeg.exec(args)
+        const data = await ffmpeg.readFile(outputName)
+        const blob = new Blob([data.buffer], { type: 'video/mp4' })
+        const url = URL.createObjectURL(blob)
+        updateItem(item.id, { status: 'done', progress: 100, outputUrl: url })
+
+        // cleanup
+        try { await ffmpeg.deleteFile(inputName) } catch {}
+        try { await ffmpeg.deleteFile(outputName) } catch {}
+      } catch (err) {
+        updateItem(item.id, { status: 'error', error: err?.message || String(err) })
+      }
     }
+
+    processNext()
+  }, [queue, running, ready, ffmpeg, selectedScale, crf, preset])
+
+  const updateItem = (id, patch) => {
+    setQueue(prev => prev.map(it => it.id === id ? { ...it, ...patch } : it))
   }
 
-  const saveToken = async () => {
-    setLoading(true)
-    setMessage('')
-    try {
-      const res = await fetch(`${baseUrl}/api/google/token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_email: email, refresh_token: refreshToken })
-      })
-      if (!res.ok) throw new Error(await res.text())
-      setMessage('Saved Google refresh token')
-      await fetchStatus()
-    } catch (e) {
-      setMessage(`Error: ${e.message}`)
-    } finally {
-      setLoading(false)
-    }
+  const clearFinished = () => {
+    setQueue(prev => prev.filter(it => it.status !== 'done' && it.status !== 'error'))
   }
 
-  const triggerNow = async () => {
-    setLoading(true)
-    setMessage('')
-    try {
-      const res = await fetch(`${baseUrl}/api/trigger`, { method: 'POST' })
-      const data = await res.json()
-      setMessage(`Triggered. Results: ${JSON.stringify(data.results || data)}`)
-    } catch (e) {
-      setMessage(`Error: ${e.message}`)
-    } finally {
-      setLoading(false)
-    }
+  const cancelItem = (id) => {
+    // ffmpeg.wasm does not support mid-job cancel cleanly; mark as skipped
+    updateItem(id, { status: 'skipped' })
   }
+
+  const totalQueued = queue.filter(q => q.status === 'queued').length
+  const totalProcessing = queue.filter(q => q.status === 'processing').length
+  const totalDone = queue.filter(q => q.status === 'done').length
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white">
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,rgba(59,130,246,0.08),transparent_50%)]"></div>
-
-      <header className="relative z-10 pt-10 text-center">
-        <h1 className="text-4xl font-bold tracking-tight">Calendar SMS Reminders</h1>
-        <p className="text-blue-200/80 mt-2">Syncs your Google Calendar and texts you before meetings, with automatic timezone conversion</p>
+    <div className="min-h-screen bg-slate-950 text-white">
+      <header className="px-6 py-8 text-center">
+        <h1 className="text-3xl font-bold">Infinite Video Compressor</h1>
+        <p className="text-slate-300 mt-2">Drop videos and they will compress continuously in your browser. Add more at any time.</p>
       </header>
 
-      <main className="relative z-10 max-w-5xl mx-auto px-6 py-10 grid md:grid-cols-2 gap-8">
-        <section className="bg-slate-800/60 border border-blue-500/20 rounded-2xl p-6">
-          <h2 className="text-xl font-semibold mb-4">Your Details</h2>
-          <div className="space-y-4">
-            <div>
-              <label className="block text-sm text-blue-200/80 mb-1">Email</label>
-              <input value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com" className="w-full bg-slate-900/60 border border-slate-700 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" />
-            </div>
-            <div>
-              <label className="block text-sm text-blue-200/80 mb-1">Phone (E.164)</label>
-              <input value={phone} onChange={e=>setPhone(e.target.value)} placeholder="+15551234567" className="w-full bg-slate-900/60 border border-slate-700 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" />
-            </div>
-            <div>
-              <label className="block text-sm text-blue-200/80 mb-1">Timezone (IANA)</label>
-              <input value={tz} onChange={e=>setTz(e.target.value)} placeholder="America/Los_Angeles" className="w-full bg-slate-900/60 border border-slate-700 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" />
-            </div>
-            <button onClick={saveUser} disabled={loading} className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-4 py-2 rounded font-semibold">Save Details</button>
+      <main className="max-w-6xl mx-auto px-6 pb-16">
+        {!ready ? (
+          <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-6 text-center">
+            <p className="text-lg">{loadingMsg || 'Initializing…'}</p>
+            <p className="text-slate-400 mt-2">This loads a WebAssembly build of FFmpeg (~3–4 MB). It runs fully locally.</p>
           </div>
-        </section>
-
-        <section className="bg-slate-800/60 border border-blue-500/20 rounded-2xl p-6">
-          <h2 className="text-xl font-semibold mb-4">Reminder Settings</h2>
-          <div className="space-y-4">
-            <div>
-              <label className="block text-sm text-blue-200/80 mb-1">Minutes before meeting</label>
-              <input type="number" min={1} max={10080} value={minutesBefore} onChange={e=>setMinutesBefore(e.target.value)} className="w-full bg-slate-900/60 border border-slate-700 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" />
-            </div>
-            <div className="flex items-center gap-3">
-              <input id="active" type="checkbox" checked={active} onChange={e=>setActive(e.target.checked)} />
-              <label htmlFor="active" className="text-blue-200/80">Active</label>
-            </div>
-            <button onClick={saveRule} disabled={loading} className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-4 py-2 rounded font-semibold">Save Rule</button>
-          </div>
-        </section>
-
-        <section className="bg-slate-800/60 border border-blue-500/20 rounded-2xl p-6 md:col-span-2">
-          <h2 className="text-xl font-semibold mb-4">Connect Google Calendar</h2>
-          <p className="text-blue-200/80 text-sm mb-3">Paste a Google OAuth refresh token with calendar.readonly scope. In production, use a proper OAuth flow.</p>
-          <div className="flex flex-col md:flex-row gap-3">
-            <input value={refreshToken} onChange={e=>setRefreshToken(e.target.value)} placeholder="Refresh token" className="flex-1 bg-slate-900/60 border border-slate-700 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500" />
-            <button onClick={saveToken} disabled={loading} className="bg-green-600 hover:bg-green-500 disabled:opacity-50 px-4 py-2 rounded font-semibold">Save Token</button>
-            <button onClick={triggerNow} disabled={loading} className="bg-purple-600 hover:bg-purple-500 disabled:opacity-50 px-4 py-2 rounded font-semibold">Trigger Now</button>
-          </div>
-        </section>
-
-        <section className="bg-slate-800/60 border border-blue-500/20 rounded-2xl p-6 md:col-span-2">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-xl font-semibold">Status</h2>
-            <button onClick={fetchStatus} className="text-sm bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded">Refresh</button>
-          </div>
-          {status ? (
-            status.error ? (
-              <p className="text-red-300">{status.error}</p>
-            ) : (
-              <div className="text-blue-100 text-sm space-y-2">
-                <p>Next run (UTC): {status.next_run || 'n/a'}</p>
-                <div className="grid md:grid-cols-2 gap-4 mt-2">
-                  <div>
-                    <h3 className="font-semibold mb-1">Users</h3>
-                    <pre className="bg-slate-900/60 p-3 rounded overflow-auto text-xs">{JSON.stringify(status.users, null, 2)}</pre>
-                  </div>
-                  <div>
-                    <h3 className="font-semibold mb-1">Rules</h3>
-                    <pre className="bg-slate-900/60 p-3 rounded overflow-auto text-xs">{JSON.stringify(status.rules, null, 2)}</pre>
+        ) : (
+          <>
+            <section className="grid md:grid-cols-3 gap-6">
+              <div className="md:col-span-2">
+                <div
+                  onDragOver={e => e.preventDefault()}
+                  onDrop={onDrop}
+                  className="border-2 border-dashed border-slate-700 hover:border-slate-500 rounded-2xl p-8 text-center bg-slate-900/40">
+                  <p className="text-slate-200 font-medium">Drag & drop videos here</p>
+                  <p className="text-slate-400 text-sm mt-1">MP4/MOV/WEBM, multiple files supported</p>
+                  <div className="mt-4">
+                    <label className="inline-block">
+                      <input type="file" accept="video/*" multiple className="hidden" onChange={onBrowse} />
+                      <span className="cursor-pointer bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded">Browse Files</span>
+                    </label>
                   </div>
                 </div>
+
+                <div className="mt-6 bg-slate-900/60 border border-slate-800 rounded-2xl">
+                  <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                    <h2 className="font-semibold">Queue</h2>
+                    <div className="text-sm text-slate-400">Queued: {totalQueued} • Processing: {totalProcessing} • Done: {totalDone}</div>
+                  </div>
+                  <ul className="divide-y divide-slate-800">
+                    {queue.length === 0 && (
+                      <li className="p-4 text-slate-400">No videos yet. Add some to get started.</li>
+                    )}
+                    {queue.map(item => (
+                      <li key={item.id} className="p-4 flex flex-col md:flex-row md:items-center gap-3">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-3">
+                            <span className="truncate font-medium">{item.name}</span>
+                            <span className="text-xs px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-300">{item.status}</span>
+                          </div>
+                          <div className="w-full h-2 bg-slate-800 rounded mt-2 overflow-hidden">
+                            <div className="h-full bg-blue-600 transition-all" style={{ width: `${item.progress || 0}%` }} />
+                          </div>
+                          {item.error && <p className="text-red-400 text-sm mt-1">{item.error}</p>}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {item.outputUrl && (
+                            <a href={item.outputUrl} download={item.name.replace(/\.[^.]+$/, '') + '-compressed.mp4'} className="bg-emerald-600 hover:bg-emerald-500 px-3 py-1.5 rounded text-sm">Download</a>
+                          )}
+                          {!['done','error','skipped'].includes(item.status) && (
+                            <button onClick={() => cancelItem(item.id)} className="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded text-sm">Skip</button>
+                          )}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                  {queue.length > 0 && (
+                    <div className="px-4 py-3 border-t border-slate-800 flex items-center justify-between">
+                      <button onClick={clearFinished} className="text-sm text-slate-300 hover:text-white">Clear finished</button>
+                      <div className="flex items-center gap-3">
+                        {!running ? (
+                          <button onClick={() => setRunning(true)} className="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded font-semibold">Start</button>
+                        ) : (
+                          <button onClick={() => setRunning(false)} className="bg-slate-700 hover:bg-slate-600 px-4 py-2 rounded font-semibold">Pause</button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
-            )
-          ) : (
-            <p className="text-blue-200/80">Loading…</p>
-          )}
-          {message && (
-            <div className="mt-4 text-sm bg-slate-900/60 border border-slate-700 rounded p-3">{message}</div>
-          )}
-        </section>
+
+              <aside className="bg-slate-900/60 border border-slate-800 rounded-2xl p-5">
+                <h2 className="font-semibold mb-3">Compression Settings</h2>
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-sm text-slate-300 mb-1">Max Size</label>
+                    <select value={sizePreset} onChange={e => setSizePreset(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2">
+                      {presets.map(p => (
+                        <option key={p.id} value={p.id}>{p.label}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm text-slate-300 mb-1">Quality (CRF {crf})</label>
+                    <input type="range" min={18} max={32} value={crf} onChange={e => setCrf(Number(e.target.value))} className="w-full" />
+                    <p className="text-xs text-slate-400 mt-1">Lower = better quality/larger file. 23–25 is a good balance.</p>
+                  </div>
+                  <div>
+                    <label className="block text-sm text-slate-300 mb-1">Speed Preset</label>
+                    <select value={preset} onChange={e => setPreset(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2">
+                      {['ultrafast','superfast','veryfast','faster','fast','medium','slow','slower','veryslow'].map(p => (
+                        <option key={p} value={p}>{p}</option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-slate-400 mt-1">Faster = bigger file. Slower = smaller file, more CPU.</p>
+                  </div>
+                  <div className="text-xs text-slate-400">
+                    Tip: Keep this tab open. The queue will keep processing infinitely—add files anytime.
+                  </div>
+                </div>
+              </aside>
+            </section>
+          </>
+        )}
       </main>
 
-      <footer className="relative z-10 text-center text-blue-300/60 pb-8">Backend: {baseUrl}</footer>
+      <footer className="text-center text-slate-500 text-sm py-8">
+        Powered by FFmpeg.wasm. Your videos never leave your device.
+      </footer>
     </div>
   )
 }
